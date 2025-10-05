@@ -7,42 +7,36 @@ module gpu_top #(
   parameter int ADDR_WIDTH   = 32,
   parameter int INSTR_DEPTH  = 256,
   parameter int FIFO_DEPTH   = 64,
-  parameter int NUM_MASTERS  = 3, // 0: vertex_fetch, 1: shader_core, 2: framebuffer
-  parameter int NUM_SLAVES   = 1  // 0: main memory (DRAM)
+  parameter int NUM_MASTERS  = 3,
+  parameter int NUM_SLAVES   = 1
 )(
   input  logic                     clk,
   input  logic                     rst_n,
-
-  // CPU bus interface for control and shader loading
   input  logic                     i_bus_we,
   input  logic [ADDR_WIDTH-1:0]    i_bus_addr,
   input  logic [DATA_WIDTH-1:0]    i_bus_wdata,
   output logic [DATA_WIDTH-1:0]    o_bus_rdata,
-
-  // Main memory (DRAM) interface
   output logic                     o_dram_we,
   output logic [ADDR_WIDTH-1:0]    o_dram_addr,
   output logic [DATA_WIDTH-1:0]    o_dram_wdata,
   input  logic [DATA_WIDTH-1:0]    i_dram_rdata
 );
 
-  localparam int VERTEX_POS_BITS    = CORD_WIDTH * 2 * 3; // 3 vertices x,y (10-bit coords)
-  localparam int VERTEX_COLOR_BITS  = DATA_WIDTH * 3;     // 3 colors
-  localparam int VERTEX_UV_BITS     = DATA_WIDTH * 2 * 3; // 3 UV pairs
+  localparam int VERTEX_POS_BITS    = CORD_WIDTH * 2 * 3;
+  localparam int VERTEX_COLOR_BITS  = DATA_WIDTH * 3;
+  localparam int VERTEX_UV_BITS     = DATA_WIDTH * 2 * 3;
   localparam int VERTEX_TOTAL_BITS  = VERTEX_POS_BITS + VERTEX_COLOR_BITS + VERTEX_UV_BITS;
   localparam int FIFO_DATA_WIDTH    = (2 * CORD_WIDTH) + (3 * (2 * CORD_WIDTH + 1));
   localparam int INSTR_WIDTH = 32;
 
-  // Memory map for CPU interface
-  localparam ADDR_CONTROL      = 32'h00000000;  // Control register
-  localparam ADDR_STATUS       = 32'h00000004;  // Status register
-  localparam ADDR_VERTEX_BASE  = 32'h00000008;  // Vertex buffer base address
-  localparam ADDR_VERTEX_COUNT = 32'h0000000C;  // Number of vertices
-  localparam ADDR_PC           = 32'h00000010;  // Shader program counter
-  localparam ADDR_FB_BASE      = 32'h00000014;  // Framebuffer base address
-  localparam ADDR_SHADER_BASE  = 32'h00001000;  // Shader memory starts here
+  localparam ADDR_CONTROL      = 32'h00000000;
+  localparam ADDR_STATUS       = 32'h00000004;
+  localparam ADDR_VERTEX_BASE  = 32'h00000008;
+  localparam ADDR_VERTEX_COUNT = 32'h0000000C;
+  localparam ADDR_PC           = 32'h00000010;
+  localparam ADDR_FB_BASE      = 32'h00000014;
+  localparam ADDR_SHADER_BASE  = 32'h00001000;
 
-  // Pipeline states
   typedef enum logic [2:0] {
     PIPE_IDLE,
     PIPE_FETCH_VERTEX,
@@ -52,18 +46,13 @@ module gpu_top #(
     PIPE_DONE
   } pipeline_state_t;
 
-  // Reset sync
   logic glbl_rst_n;
-
-  // Control registers
   logic [ADDR_WIDTH-1:0] vertex_base_addr;
   logic [15:0]           vertex_count;
   logic [15:0]           current_vertex;
-  // program counter is 32 bits for bus access, lower bits index instruction memory
   logic [31:0]           shader_pc;
   logic [ADDR_WIDTH-1:0] fb_base_addr;
   
-  // Pipeline control
   pipeline_state_t pipe_state, next_pipe_state;
   logic pipeline_start;
   logic pipeline_busy;
@@ -71,11 +60,10 @@ module gpu_top #(
   logic rasterizer_done;
   logic shader_exec_done;
   
-  // Controller interface
   logic controller_start;
   logic controller_irq;
+  logic start_request;
   
-  // Interconnect signals
   logic [NUM_MASTERS-1:0] master_req;
   logic [NUM_MASTERS-1:0] master_we;
   logic [NUM_MASTERS-1:0][ADDR_WIDTH-1:0] master_addr;
@@ -88,7 +76,6 @@ module gpu_top #(
   logic [NUM_SLAVES-1:0][DATA_WIDTH-1:0] slave_wdata;
   logic [NUM_SLAVES-1:0][DATA_WIDTH-1:0] slave_rdata;
 
-  // Shader signals
   logic [INSTR_WIDTH-1:0] shader_instruction;
   logic [INSTR_WIDTH-1:0] shader_host_rdata;
   logic shader_exec_en;
@@ -96,39 +83,33 @@ module gpu_top #(
   logic [3:0] shader_rd, shader_rs1, shader_rs2;
   logic [11:0] shader_imm;
   
-  // Vertex data
-  logic [32*15-1:0] vertex_data_full;  // Full 480-bit from vertex_fetch
+  logic [32*15-1:0] vertex_data_full;
   logic [VERTEX_TOTAL_BITS-1:0] vertex_data;
-  logic signed [CORD_WIDTH-1:0] v0x, v0y, v1x, v1y, v2x, v2y;
+  logic [CORD_WIDTH-1:0] v0x, v0y, v1x, v1y, v2x, v2y;
   logic [DATA_WIDTH-1:0] v0_color, v1_color, v2_color;
   logic [DATA_WIDTH-1:0] v0_u, v0_v, v1_u, v1_v, v2_u, v2_v;
   
-  // Rasterizer signals
   logic rast_start;
   logic rast_frag_valid;
-  logic signed [CORD_WIDTH-1:0] frag_x, frag_y;
+  logic [CORD_WIDTH-1:0] frag_x, frag_y;
   logic signed [(CORD_WIDTH*2):0] lambda0, lambda1, lambda2;
   
-  // FIFO signals
   logic fifo_wr, fifo_rd, fifo_full, fifo_empty;
   logic [FIFO_DATA_WIDTH-1:0] fifo_wdata, fifo_rdata;
   
-  // Fragment shader signals
   logic fs_in_valid;
-  logic signed [CORD_WIDTH-1:0] fs_in_x, fs_in_y;
+  logic [CORD_WIDTH-1:0] fs_in_x, fs_in_y;
   logic signed [(CORD_WIDTH*2):0] fs_in_lambda0, fs_in_lambda1, fs_in_lambda2;
   logic [DATA_WIDTH-1:0] interpolated_color, interpolated_u, interpolated_v;
   
-  // Texture unit signals
   logic tex_req_valid;
   logic [DATA_WIDTH-1:0] tex_u, tex_v;
   logic texel_valid;
   logic [DATA_WIDTH-1:0] texel_color_single;
   logic [VEC_SIZE-1:0][DATA_WIDTH-1:0] texel_color_vec;
   
-  // Framebuffer signals
   logic pixel_we;
-  logic signed [CORD_WIDTH-1:0] pixel_x, pixel_y;
+  logic [CORD_WIDTH-1:0] pixel_x, pixel_y;
   logic [VEC_SIZE-1:0][DATA_WIDTH-1:0] pixel_color;
 
   reset_sync reset_sync_inst (
@@ -137,9 +118,7 @@ module gpu_top #(
     .srst_n (glbl_rst_n)
   );
 
-  // Register to capture start request  
-  logic start_request;
-  
+  // FIXED: Hold start_request for FSM to see it
   always_ff @(posedge clk or negedge glbl_rst_n) begin
     if (!glbl_rst_n) begin
       vertex_base_addr <= '0;
@@ -149,17 +128,18 @@ module gpu_top #(
       controller_start <= 1'b0;
       start_request    <= 1'b0;
     end else begin
-      controller_start <= 1'b0;  // Single cycle pulse
-      start_request    <= 1'b0;
+      controller_start <= 1'b0;
+      
+      // Hold start_request until FSM acknowledges it
+      if (i_bus_we && i_bus_addr == ADDR_CONTROL && i_bus_wdata[0]) begin
+        controller_start <= 1'b1;
+        start_request    <= 1'b1;
+      end else if (pipe_state != PIPE_IDLE) begin
+        start_request <= 1'b0;  // Clear once FSM starts
+      end
       
       if (i_bus_we) begin
         case (i_bus_addr)
-          ADDR_CONTROL: begin
-            if (i_bus_wdata[0]) begin
-              controller_start <= 1'b1;
-              start_request    <= 1'b1;  // Hold for state machine
-            end
-          end
           ADDR_VERTEX_BASE:  vertex_base_addr <= i_bus_wdata;
           ADDR_VERTEX_COUNT: vertex_count     <= i_bus_wdata[15:0];
           ADDR_PC:           shader_pc        <= i_bus_wdata;
@@ -169,7 +149,6 @@ module gpu_top #(
     end
   end
   
-  // CPU read path
   always_comb begin
     if (i_bus_addr >= ADDR_SHADER_BASE) begin
       o_bus_rdata = shader_host_rdata;
@@ -177,7 +156,7 @@ module gpu_top #(
       o_bus_rdata = '0;
       case (i_bus_addr)
         ADDR_STATUS:       o_bus_rdata = {30'b0, controller_irq, pipeline_busy};
-        ADDR_CONTROL:      o_bus_rdata = {31'b0, controller_start};
+        ADDR_CONTROL:      o_bus_rdata = {31'b0, start_request};
         ADDR_VERTEX_BASE:  o_bus_rdata = vertex_base_addr;
         ADDR_VERTEX_COUNT: o_bus_rdata = {16'b0, vertex_count};
         ADDR_PC:           o_bus_rdata = shader_pc;
@@ -189,6 +168,30 @@ module gpu_top #(
 
   assign pipeline_busy = (pipe_state != PIPE_IDLE);
   
+  // FIXED: Proper rasterizer handshake
+  logic rast_active;
+  logic rast_start_pulse;
+  logic pipe_state_was_rast;
+  
+  always_ff @(posedge clk or negedge glbl_rst_n) begin
+    if (!glbl_rst_n) begin
+      pipe_state_was_rast <= 1'b0;
+      rast_active <= 1'b0;
+    end else begin
+      pipe_state_was_rast <= (pipe_state == PIPE_RASTERIZE);
+      
+      if (pipe_state != PIPE_RASTERIZE) begin
+        rast_active <= 1'b0;
+      end else begin
+        if (!rasterizer_done) rast_active <= 1'b1;
+        else if (rasterizer_done && rast_active) rast_active <= 1'b0;
+      end
+    end
+  end
+  
+  assign rast_start_pulse = (pipe_state == PIPE_RASTERIZE) && !pipe_state_was_rast;
+  assign rast_start = rast_start_pulse;
+  
   always_ff @(posedge clk or negedge glbl_rst_n) begin
     if (!glbl_rst_n) begin
       pipe_state <= PIPE_IDLE;
@@ -196,10 +199,10 @@ module gpu_top #(
     end else begin
       pipe_state <= next_pipe_state;
       
-      if (pipe_state == PIPE_IDLE && controller_start) begin
+      if (pipe_state == PIPE_IDLE && (controller_start || start_request)) begin
         current_vertex <= '0;
       end else if (pipe_state == PIPE_FETCH_VERTEX && vertex_fetch_done) begin
-        current_vertex <= current_vertex + 3;  // Move to next triangle
+        current_vertex <= current_vertex + 3;
       end
     end
   end
@@ -218,12 +221,12 @@ module gpu_top #(
       end
       
       PIPE_EXECUTE_SHADER: begin
-        // Simple: execute one shader instruction then move on
         next_pipe_state = PIPE_RASTERIZE;
       end
       
       PIPE_RASTERIZE: begin
-        if (rasterizer_done) begin
+        // Wait for rasterizer to actually run and complete
+        if (rasterizer_done && rast_active) begin
           if (current_vertex >= vertex_count) 
             next_pipe_state = PIPE_DONE;
           else
@@ -239,29 +242,23 @@ module gpu_top #(
     endcase
   end
 
-  controller #(
-    .QUEUE_DEPTH(16)
-  ) ctrl_inst (
+  controller #(.QUEUE_DEPTH(16)) ctrl_inst (
     .clk              (clk),
     .rst_n            (glbl_rst_n),
     .i_bus_addr       (i_bus_addr),
     .i_bus_wdata      (i_bus_wdata),
     .i_bus_we         (i_bus_we && (i_bus_addr == ADDR_CONTROL || i_bus_addr == ADDR_STATUS)),
-    .o_bus_rdata      (),  // Not used, we handle reads above
+    .o_bus_rdata      (),
     .i_pipeline_busy  (pipeline_busy),
     .o_start_pipeline (pipeline_start),
     .o_irq            (controller_irq)
   );
 
-  
-  shader_loader #(
-    .INSTR_WIDTH(INSTR_WIDTH),
-    .INSTR_DEPTH(INSTR_DEPTH)
-  ) shader_loader_inst (
+  shader_loader #(.INSTR_WIDTH(INSTR_WIDTH), .INSTR_DEPTH(INSTR_DEPTH)) shader_loader_inst (
     .clk          (clk),
     .rst_n        (glbl_rst_n),
     .i_host_we    (i_bus_we && i_bus_addr >= ADDR_SHADER_BASE),
-    .i_host_addr  (i_bus_addr[$clog2(INSTR_DEPTH)-1+2:2]),  // Word addressing
+    .i_host_addr  (i_bus_addr[$clog2(INSTR_DEPTH)-1+2:2]),
     .i_host_wdata (i_bus_wdata),
     .o_host_rdata (shader_host_rdata),
     .i_gpu_addr   (shader_pc[$clog2(INSTR_DEPTH)-1:0]),
@@ -279,11 +276,7 @@ module gpu_top #(
 
   assign shader_exec_en = (pipe_state == PIPE_EXECUTE_SHADER);
   
-  shader_core #(
-    .DATA_WIDTH(DATA_WIDTH),
-    .VEC_SIZE  (VEC_SIZE),
-    .NUM_REGS  (16)
-  ) core0 (
+  shader_core #(.DATA_WIDTH(DATA_WIDTH), .VEC_SIZE(VEC_SIZE), .NUM_REGS(16)) core0 (
     .clk        (clk),
     .rst_n      (glbl_rst_n),
     .i_exec_en  (shader_exec_en),
@@ -292,12 +285,12 @@ module gpu_top #(
     .i_rs1_addr (shader_rs1),
     .i_rs2_addr (shader_rs2),
     .o_mem_req  (master_req[1]),
-    .i_mem_ready(1'b1)  // Always ready for simplicity
+    .i_mem_ready(1'b1)
   );
   
-  assign master_addr[1] = '0;   // Would need proper address generation
+  assign master_addr[1] = '0;
   assign master_wdata[1] = '0;
-  assign master_we[1] = 1'b0;        // Shader reads only for now
+  assign master_we[1] = 1'b0;
 
   gpu_interconnect #(
     .NUM_MASTERS (NUM_MASTERS),
@@ -319,11 +312,6 @@ module gpu_top #(
     .i_slave_rdata  (slave_rdata)
   );
   
-  logic [DATA_WIDTH-1:0] dram_rdata_delayed;
-  always_ff @(posedge clk) begin
-    dram_rdata_delayed <= i_dram_rdata;
-  end
-
   assign o_dram_we = slave_we[0];
   assign o_dram_addr = slave_addr[0];
   assign o_dram_wdata = slave_wdata[0];
@@ -343,14 +331,13 @@ module gpu_top #(
     .o_mem_req     (master_req[0]),
     .o_mem_addr    (master_addr[0]),
     .i_mem_ready   (1'b1),
-    .i_mem_rdata   (master_rdata[0][31:0]),  // Single 32-bit word
+    .i_mem_rdata   (master_rdata[0][31:0]),
     .o_vertex_data (vertex_data_full)
   );
   
-  assign master_wdata[0] = '0;  // Vertex fetch only reads
-  assign master_we[0] = 1'b0;        // Never write
+  assign master_wdata[0] = '0;
+  assign master_we[0] = 1'b0;
   
-  // Unpack vertex data from 15 32-bit words
   assign v0x = vertex_data_full[0*32 +: 10];
   assign v0y = vertex_data_full[1*32 +: 10];
   assign v1x = vertex_data_full[2*32 +: 10];
@@ -367,14 +354,13 @@ module gpu_top #(
   assign v2_u = vertex_data_full[13*32 +: 32];
   assign v2_v = vertex_data_full[14*32 +: 32];
 
-  // Latch vertex coordinates to prevent mid-rasterization changes  
-  (* dont_touch = "true" *) logic signed [CORD_WIDTH-1:0] v0x_latched, v0y_latched, v1x_latched, v1y_latched, v2x_latched, v2y_latched;
+  // FIXED: Latch coordinates before rasterization
+  (* dont_touch = "true" *) logic [CORD_WIDTH-1:0] v0x_latched, v0y_latched, v1x_latched, v1y_latched, v2x_latched, v2y_latched;
   
   always_ff @(posedge clk) begin
     if (pipe_state == PIPE_EXECUTE_SHADER) begin
-      // Latch coordinates before rasterization starts - FORCE SYNTHESIS TO KEEP
       v0x_latched <= v0x;
-      v0y_latched <= v0y; 
+      v0y_latched <= v0y;
       v1x_latched <= v1x;
       v1y_latched <= v1y;
       v2x_latched <= v2x;
@@ -382,20 +368,17 @@ module gpu_top #(
     end
   end
   
-  assign rast_start = (pipe_state == PIPE_RASTERIZE);
-  
-  rasterizer #(
-    .CORD_WIDTH(CORD_WIDTH)
-  ) rast_inst (
+  // FIXED: Connect rasterizer to LATCHED coordinates
+  rasterizer #(.CORD_WIDTH(CORD_WIDTH)) rast_inst (
     .clk              (clk),
     .rst_n            (glbl_rst_n),
     .i_start          (rast_start),
-    .i_v0_x           (v0x),
-    .i_v0_y           (v0y),
-    .i_v1_x           (v1x),
-    .i_v1_y           (v1y),
-    .i_v2_x           (v2x),
-    .i_v2_y           (v2y),
+    .i_v0_x           (v0x_latched),
+    .i_v0_y           (v0y_latched),
+    .i_v1_x           (v1x_latched),
+    .i_v1_y           (v1y_latched),
+    .i_v2_x           (v2x_latched),
+    .i_v2_y           (v2y_latched),
     .o_fragment_valid (rast_frag_valid),
     .o_fragment_x     (frag_x),
     .o_fragment_y     (frag_y),
@@ -405,13 +388,11 @@ module gpu_top #(
     .o_done           (rasterizer_done)
   );
 
-  assign fifo_wr = rast_frag_valid;
+  // FIXED: Guard FIFO writes
+  assign fifo_wr = rast_frag_valid && !fifo_full;
   assign fifo_wdata = {frag_x, frag_y, lambda0, lambda1, lambda2};
   
-  fifo #(
-    .DATA_WIDTH(FIFO_DATA_WIDTH),
-    .DEPTH     (FIFO_DEPTH)
-  ) frag_fifo (
+  fifo #(.DATA_WIDTH(FIFO_DATA_WIDTH), .DEPTH(FIFO_DEPTH)) frag_fifo (
     .clk      (clk),
     .rst_n    (glbl_rst_n),
     .i_wr_en  (fifo_wr),
@@ -422,63 +403,37 @@ module gpu_top #(
     .o_empty  (fifo_empty)
   );
   
-  // Proper ready/valid handshaking
   logic fs_ready;
-  assign fs_in_valid = !fifo_empty && fs_ready;
-  assign fifo_rd = fs_in_valid;
+  assign fs_in_valid = !fifo_empty;
+  assign fifo_rd = fs_in_valid && fs_ready;
   assign {fs_in_x, fs_in_y, fs_in_lambda0, fs_in_lambda1, fs_in_lambda2} = fifo_rdata;
 
-  attribute_interpolator #(
-    .ATTR_WIDTH  (DATA_WIDTH),
-    .WEIGHT_WIDTH(2*CORD_WIDTH+1)
-  ) color_interp (
-    .i_attr0   (v0_color),
-    .i_attr1   (v1_color),
-    .i_attr2   (v2_color),
-    .i_lambda0 (fs_in_lambda0),
-    .i_lambda1 (fs_in_lambda1),
-    .i_lambda2 (fs_in_lambda2),
+  attribute_interpolator #(.ATTR_WIDTH(DATA_WIDTH), .WEIGHT_WIDTH(2*CORD_WIDTH+1)) color_interp (
+    .i_attr0(v0_color), .i_attr1(v1_color), .i_attr2(v2_color),
+    .i_lambda0(fs_in_lambda0), .i_lambda1(fs_in_lambda1), .i_lambda2(fs_in_lambda2),
     .o_interpolated_attr(interpolated_color)
   );
   
-  attribute_interpolator #(
-    .ATTR_WIDTH  (DATA_WIDTH),
-    .WEIGHT_WIDTH(2*CORD_WIDTH+1)
-  ) u_interp (
-    .i_attr0   (v0_u),
-    .i_attr1   (v1_u),
-    .i_attr2   (v2_u),
-    .i_lambda0 (fs_in_lambda0),
-    .i_lambda1 (fs_in_lambda1),
-    .i_lambda2 (fs_in_lambda2),
+  attribute_interpolator #(.ATTR_WIDTH(DATA_WIDTH), .WEIGHT_WIDTH(2*CORD_WIDTH+1)) u_interp (
+    .i_attr0(v0_u), .i_attr1(v1_u), .i_attr2(v2_u),
+    .i_lambda0(fs_in_lambda0), .i_lambda1(fs_in_lambda1), .i_lambda2(fs_in_lambda2),
     .o_interpolated_attr(interpolated_u)
   );
   
-  attribute_interpolator #(
-    .ATTR_WIDTH  (DATA_WIDTH),
-    .WEIGHT_WIDTH(2*CORD_WIDTH+1)
-  ) v_interp (
-    .i_attr0   (v0_v),
-    .i_attr1   (v1_v),
-    .i_attr2   (v2_v),
-    .i_lambda0 (fs_in_lambda0),
-    .i_lambda1 (fs_in_lambda1),
-    .i_lambda2 (fs_in_lambda2),
+  attribute_interpolator #(.ATTR_WIDTH(DATA_WIDTH), .WEIGHT_WIDTH(2*CORD_WIDTH+1)) v_interp (
+    .i_attr0(v0_v), .i_attr1(v1_v), .i_attr2(v2_v),
+    .i_lambda0(fs_in_lambda0), .i_lambda1(fs_in_lambda1), .i_lambda2(fs_in_lambda2),
     .o_interpolated_attr(interpolated_v)
   );
 
-  fragment_shader #(
-    .DATA_WIDTH(DATA_WIDTH),
-    .VEC_SIZE  (VEC_SIZE),
-    .CORD_WIDTH(CORD_WIDTH)
-  ) fs_inst (
+  fragment_shader #(.DATA_WIDTH(DATA_WIDTH), .VEC_SIZE(VEC_SIZE), .CORD_WIDTH(CORD_WIDTH)) fs_inst (
     .clk             (clk),
     .rst_n           (glbl_rst_n),
     .i_frag_valid    (fs_in_valid),
     .o_ready         (fs_ready),
     .i_frag_x        (fs_in_x),
     .i_frag_y        (fs_in_y),
-    .i_frag_color    ({VEC_SIZE{interpolated_color}}),  // Replicate for all channels
+    .i_frag_color    ({VEC_SIZE{interpolated_color}}),
     .i_frag_tex_coord({interpolated_v, interpolated_u}),
     .o_tex_req_valid (tex_req_valid),
     .o_tex_u_coord   (tex_u),
@@ -491,12 +446,7 @@ module gpu_top #(
     .o_pixel_color   (pixel_color)
   );
   
-  texture_unit #(
-    .TEX_WIDTH  (256),
-    .TEX_HEIGHT (256),
-    .CORD_WIDTH (16),
-    .DATA_WIDTH (DATA_WIDTH)
-  ) tex_unit (
+  texture_unit #(.TEX_WIDTH(256), .TEX_HEIGHT(256), .CORD_WIDTH(16), .DATA_WIDTH(DATA_WIDTH)) tex_unit (
     .clk          (clk),
     .rst_n        (glbl_rst_n),
     .i_req_valid  (tex_req_valid),
@@ -506,13 +456,11 @@ module gpu_top #(
     .o_texel_color(texel_color_single)
   );
   
-  // Replicate texture color to all vector channels
   assign texel_color_vec = {VEC_SIZE{texel_color_single}};
 
-  // DEBUG: Test pixel write at boot
   logic [7:0] test_counter;
   logic test_pixel_we;
-  logic signed [CORD_WIDTH-1:0] pixel_x_mux, pixel_y_mux;
+  logic [CORD_WIDTH-1:0] pixel_x_mux, pixel_y_mux;
   logic [DATA_WIDTH-1:0] pixel_color_mux;
   
   always_ff @(posedge clk or negedge glbl_rst_n) begin
@@ -537,12 +485,12 @@ module gpu_top #(
     .i_pixel_we   (test_pixel_we | pixel_we),
     .i_pixel_x    (pixel_x_mux),
     .i_pixel_y    (pixel_y_mux),
-    .i_pixel_color(pixel_color_mux),  // Use first channel for now
+    .i_pixel_color(pixel_color_mux),
     .o_mem_req    (master_req[2]),
     .o_mem_addr   (master_addr[2]),
     .o_mem_wdata  (master_wdata[2])
   );
   
-  assign master_we[2] = master_req[2];  // Framebuffer always writes when requesting
+  assign master_we[2] = master_req[2];
 
 endmodule
