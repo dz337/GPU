@@ -16,15 +16,10 @@ module vertex_fetch #(
     output logic [ATTR_WIDTH*ATTRS_PER_VERTEX-1:0] o_vertex_data
 );
 
-  typedef enum logic [1:0] {
-    IDLE,
-    READING,
-    DONE
-  } state_t;
-  
+  typedef enum logic [1:0] {IDLE, READING, DONE} state_t;
   state_t state;
   logic [ATTR_WIDTH*ATTRS_PER_VERTEX-1:0] data_reg;
-  logic [4:0] word_count;  // 0-14 for 15 words, then 15 when done
+  logic [4:0] word_count;
   logic [ADDR_WIDTH-1:0] base_addr;
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -46,14 +41,12 @@ module vertex_fetch #(
         
         READING: begin
           if (i_mem_ready) begin
-            // Capture the word
             data_reg[word_count*32 +: 32] <= i_mem_rdata;
-            word_count <= word_count + 1;
-            
-            // Only transition after we've incremented past 14 (when word_count becomes 15)
-            if (word_count == ATTRS_PER_VERTEX) begin
+            // FIXED: Check against ATTRS_PER_VERTEX-1 before incrementing
+            if (word_count == ATTRS_PER_VERTEX-1) begin
               state <= DONE;
             end
+            word_count <= word_count + 1;
           end
         end
         
@@ -70,5 +63,3 @@ module vertex_fetch #(
   assign o_fetch_done = (state == DONE);
 
 endmodule
-
-
